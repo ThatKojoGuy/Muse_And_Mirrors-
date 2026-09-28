@@ -126,12 +126,10 @@ class MakeupInventoryApp(ctk.CTk):
             self.sidebar_frame,
             values=[
                 "Uncategorized",
-                "Foundation",
-                "Concealer",
-                "Lipstick",
-                "Eyeshadow",
-                "Blush",
-                "Powder",
+                "Eyes",
+                "Lips",
+                "Cheeks",
+                "Nose",
                 "Other",
             ],
         )
