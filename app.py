@@ -182,7 +182,7 @@ if st.session_state["is_admin"]:
 
     tone_input = st.sidebar.text_input("Tone / Shade", placeholder="e.g., Warm Nude").strip()
     qty_input = st.sidebar.number_input("Quantity", min_value=0, step=1, value=0)
-    price_input = st.sidebar.number_input("Price ($)", min_value=0.0, step=0.5, value=0.0, format="%.2f")
+    price_input = st.sidebar.number_input("Price", min_value=0.0, step=0.5, value=0.0, format="%.2f")
     uploaded_file = st.sidebar.file_uploader("Product Image (Optional)", type=["png", "jpg", "jpeg", "webp"])
 
     if st.sidebar.button("Add New Item", type="primary"):
@@ -252,7 +252,7 @@ with col1:
             items,
             column_config={
                 "image_url": st.column_config.LinkColumn("Image Link"),
-                "price": st.column_config.NumberColumn("Price ($)", format="$%.2f")
+                "price": st.column_config.NumberColumn("Price", format="%.2f")
             },
             use_container_width=True
         )
@@ -267,7 +267,7 @@ with col2:
     if selected_item:
         st.write(f"**{selected_item['brand']}** - {selected_item['product_name']}")
         st.write(f"Category: {selected_item['category']} | Shade: {selected_item['tone']}")
-        st.write(f"Stock: {selected_item['quantity']} | Price: ${selected_item['price']:.2f}")
+        st.write(f"Stock: {selected_item['quantity']} | Price: {selected_item['price']:.2f}")
 
         if selected_item.get("image_url"):
             st.image(selected_item["image_url"], use_column_width=True)
