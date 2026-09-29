@@ -279,4 +279,4 @@ with col2:
                     st.success(f"Item #{selected_id} deleted!")
                     st.rerun()
                 except Exception as del_err:
-                    st.error(f"Failed to delete item: {del_err}")r}")
+                    st.error(f"Failed to delete item: {del_err}")
