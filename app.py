@@ -167,7 +167,7 @@ is_admin = st.session_state["is_admin"]
 # =====================================================================
 try:
     inv_rows = (
-            supabase.table("inventory").select("*").order("created_at", desc=True).execute().data or []
+            supabase.table("inventory").select("*").order("id", desc=True).execute().data or []
     )
 except Exception as err:
     st.error(f"Inventory fetch error: {err}")
@@ -180,7 +180,7 @@ sales_history = []
 if is_admin:  # sales/revenue are only loaded for admins
     try:
         sales_history = (
-                supabase.table("sales").select("*").order("created_at", desc=True).execute().data or []
+                supabase.table("sales").select("*").order("id", desc=True).execute().data or []
         )
     except Exception as err:
         st.error(f"Sales fetch error: {err}")
@@ -343,8 +343,7 @@ with st.sidebar:
         category = st.selectbox("Target Area", CATEGORIES, key=f"add_cat_{n}")
         tone = st.text_input("Tone / Shade", placeholder="e.g., Warm Nude", key=f"add_tone_{n}").strip()
         qty = st.number_input("Stock Quantity", min_value=0, step=1, value=1, key=f"add_qty_{n}")
-        price = st.number_input("Retail Price ($)", min_value=0.0, step=0.5, value=0.0, format="%.2f",
-                                key=f"add_price_{n}")
+        price = st.number_input("Retail Price", min_value=0.0, step=0.5, value=0.0, format="%.2f", key=f"add_price_{n}")
         uploaded_file = st.file_uploader("Product Image (optional)", type=["png", "jpg", "jpeg", "webp"],
                                          key=f"add_img_{n}")
 
@@ -552,7 +551,7 @@ with tab_manage:
             edit_tone = st.text_input("Tone / Shade", value=sel["tone"], key=f"edit_tone_{k}")
             edit_qty = st.number_input("Stock Quantity", min_value=0, step=1, value=sel["quantity"],
                                        key=f"edit_qty_{k}")
-            edit_price = st.number_input("Price ($)", min_value=0.0, step=0.5, value=sel["price"], format="%.2f",
+            edit_price = st.number_input("Retail Price", min_value=0.0, step=0.5, value=sel["price"], format="%.2f",
                                          key=f"edit_price_{k}")
 
         if sel["image_url"]:
