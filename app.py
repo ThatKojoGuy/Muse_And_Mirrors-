@@ -2,6 +2,7 @@ import html
 import hmac
 import re
 import uuid
+from collections import Counter
 
 import pandas as pd
 import streamlit as st
@@ -61,14 +62,25 @@ st.markdown(
     }
     .price-tag { font-size: 18px; font-weight: 700; color: #3FB950; }
     .badge {
-        display: inline-block; font-size: 11px; padding: 3px 9px;
+        display: inline-block; font-size: 12px; padding: 3px 9px;
         border-radius: 12px; margin: 0 4px 4px 0;
         backdrop-filter: blur(6px);
     }
-    .category-badge { background: rgba(88, 166, 255, 0.15); color: #58A6FF; font-weight: 600; border: 1px solid rgba(88, 166, 255, 0.35); }
-    .shade-badge { background: rgba(139, 148, 158, 0.15); color: #B1BAC4; border: 1px solid rgba(139, 148, 158, 0.3); }
-    .status-available { background: rgba(35, 134, 54, 0.2); color: #3FB950; font-weight: 700; border: 1px solid #238636; }
-    .status-soldout { background: rgba(218, 54, 51, 0.2); color: #F8514C; font-weight: 700; border: 1px solid #DA3633; }
+    .category-badge { background: rgba(88, 166, 255, 0.15); color: #79B8FF; font-weight: 600; border: 1px solid rgba(88, 166, 255, 0.35); }
+    .shade-badge { background: rgba(139, 148, 158, 0.15); color: #C9D1D9; border: 1px solid rgba(139, 148, 158, 0.3); }
+    .status-available { background: rgba(35, 134, 54, 0.2); color: #56D364; font-weight: 700; border: 1px solid #238636; }
+    .status-low { background: rgba(210, 153, 34, 0.2); color: #E3B341; font-weight: 700; border: 1px solid #9E6A03; }
+    .status-soldout { background: rgba(218, 54, 51, 0.2); color: #FF7B72; font-weight: 700; border: 1px solid #DA3633; }
+
+    /* Accessibility: visible keyboard focus + comfortable touch targets */
+    button:focus-visible, input:focus-visible, [role="combobox"]:focus-visible {
+        outline: 2px solid #79B8FF !important; outline-offset: 2px;
+    }
+    .stButton > button, .stFormSubmitButton > button { min-height: 40px; }
+    @media (prefers-reduced-motion: reduce) {
+        [class*="st-key-card_"] { transition: none; }
+        [class*="st-key-card_"]:hover { transform: none; }
+    }
 </style>
 """,
     unsafe_allow_html=True,
@@ -79,13 +91,16 @@ st.markdown(
 # =====================================================================
 CATEGORIES = ["Uncategorized", "Eyes", "Ears", "Nose", "Lips", "Cheeks", "Other"]
 TAX_RATE = 0.05
+LOW_STOCK = 3
 BUCKET = "product_images"
-NEW_BRAND = "➕ Add New Brand"
-NEW_NAME = "➕ Add New Product Name"
 
 
 def esc(value) -> str:
     return html.escape(str(value))
+
+
+def money(value: float) -> str:
+    return f"${value:,.2f}"
 
 
 def get_secret(name: str):
@@ -109,14 +124,54 @@ def clean_item(row: dict) -> dict:
     }
 
 
+def label_of(item: dict) -> str:
+    return f"{item['brand']} — {item['product_name']} ({item['tone']})"
+
+
 def matches(item: dict, query: str) -> bool:
     return query in item["brand"].lower() or query in item["product_name"].lower()
 
 
 def status_badge(qty: int) -> str:
+    """Status is always conveyed by icon + text, never by colour alone."""
     if qty > 0:
-        return "<span class='badge status-available'>AVAILABLE</span>"
-    return "<span class='badge status-soldout'>SOLD OUT</span>"
+        out = "<span class='badge status-available'>✓ AVAILABLE</span>"
+        if qty <= LOW_STOCK:
+            out += f"<span class='badge status-low'>⚠ ONLY {qty} LEFT</span>"
+        return out
+    return "<span class='badge status-soldout'>✕ SOLD OUT</span>"
+
+
+# ---- case-insensitive name handling ---------------------------------
+def tidy(value) -> str:
+    """Trim and collapse repeated whitespace."""
+    return " ".join(str(value or "").split())
+
+
+def dedupe_ci(values) -> list:
+    """Case-insensitive unique list; keeps the most common spelling of each."""
+    groups = {}
+    for v in values:
+        groups.setdefault(v.lower(), Counter())[v] += 1
+
+    def best(counter):
+        # most common spelling; on a tie prefer one with capital letters
+        return max(counter, key=lambda v: (counter[v], v != v.lower(), v == v.title()))
+
+    return sorted((best(c) for c in groups.values()), key=str.lower)
+
+
+def canon(value, options) -> str:
+    """Map typed text onto an existing spelling ('fenty beauty' -> 'Fenty Beauty')."""
+    value = tidy(value)
+    return {o.lower(): o for o in options}.get(value.lower(), value)
+
+
+def idx_ci(options, value):
+    for i, o in enumerate(options):
+        if o.lower() == str(value).lower():
+            return i
+    return None
 
 
 # =====================================================================
@@ -156,9 +211,16 @@ except Exception as e:
 # =====================================================================
 # SESSION STATE
 # =====================================================================
-st.session_state.setdefault("is_admin", False)
-st.session_state.setdefault("cart", {})  # {item_id: qty}
-st.session_state.setdefault("form_nonce", 0)  # bump to reset the add-product form
+for key, default in {
+    "is_admin": False,
+    "cart": {},  # {item_id: qty}
+    "form_nonce": 0,  # bump to reset the add-product form
+    "quick_nonce": 0,  # bump to reset the quick-add box
+    "last_deleted": None,  # raw row, enables Undo
+    "last_receipt": None,  # shown after a sale for closure
+    "dup_pending": None,  # duplicate found while adding a product
+}.items():
+    st.session_state.setdefault(key, default)
 
 is_admin = st.session_state["is_admin"]
 
@@ -173,6 +235,7 @@ except Exception as err:
     st.error(f"Inventory fetch error: {err}")
     inv_rows = []
 
+raw_by_id = {r["id"]: r for r in inv_rows}
 inventory_items = [clean_item(r) for r in inv_rows]
 inventory_by_id = {i["id"]: i for i in inventory_items}
 
@@ -189,16 +252,39 @@ if is_admin:  # sales/revenue are only loaded for admins
 st.session_state["cart"] = {
     k: v for k, v in st.session_state["cart"].items() if k in inventory_by_id
 }
+cart = st.session_state["cart"]
 
-existing_brands = sorted({i["brand"] for i in inventory_items if i["brand"] != "N/A"})
-existing_names = sorted(
-    {i["product_name"] for i in inventory_items if i["product_name"] != "Unnamed Item"}
+# Dropdown suggestions (case-insensitive unique)
+existing_brands = dedupe_ci(i["brand"] for i in inventory_items if i["brand"] != "N/A")
+existing_names = dedupe_ci(
+    i["product_name"] for i in inventory_items if i["product_name"] != "Unnamed Item"
 )
+existing_tones = dedupe_ci(i["tone"] for i in inventory_items if i["tone"] != "N/A")
 
 
 # =====================================================================
-# STORAGE HELPERS
+# ACTIONS
 # =====================================================================
+def normalize_fields(brand_raw, name_raw, tone_raw):
+    """Apply case-insensitive matching + fallbacks to the three text fields."""
+    brand = canon(brand_raw, existing_brands) or "N/A"
+    name = canon(name_raw, existing_names) or "Unnamed Item"
+    tone = canon(tone_raw, existing_tones) or "N/A"
+    return brand, name, tone
+
+
+def find_duplicate(brand, name, tone, exclude_id=None):
+    key = (brand.lower(), name.lower(), tone.lower())
+    for i in inventory_items:
+        if i["id"] != exclude_id and (
+                i["brand"].lower(),
+                i["product_name"].lower(),
+                i["tone"].lower(),
+        ) == key:
+            return i
+    return None
+
+
 def upload_image(uploaded, brand: str, name: str):
     ext = uploaded.name.rsplit(".", 1)[-1].lower() if "." in uploaded.name else "jpg"
     slug = re.sub(r"[^a-z0-9]+", "-", f"{brand}-{name}".lower()).strip("-") or "item"
@@ -220,18 +306,36 @@ def delete_image(url):
 
 
 def delete_item(item: dict):
+    """Deletes the row but keeps its image so the delete can be undone."""
     supabase.table("inventory").delete().eq("id", item["id"]).execute()
-    delete_image(item.get("image_url"))
-    st.session_state["cart"].pop(item["id"], None)
+    st.session_state["last_deleted"] = raw_by_id.get(item["id"]) or item
+    cart.pop(item["id"], None)
 
 
-# =====================================================================
-# CHECKOUT (re-validates stock against the database)
-# =====================================================================
-def complete_sale(cart: dict):
-    """Returns (ok, message_or_list). Stock is re-checked live, decremented
-    with a guard against concurrent sales, and rolled back if logging fails."""
-    ids = list(cart.keys())
+def undo_delete():
+    row = st.session_state["last_deleted"]
+    supabase.table("inventory").insert(row).execute()
+    st.session_state["last_deleted"] = None
+
+
+def add_to_cart(item_id):
+    """Returns None on success, or a message explaining why nothing was added."""
+    item = inventory_by_id[item_id]
+    current = cart.get(item_id, 0)
+    if item["quantity"] <= 0:
+        return f"{item['product_name']} is sold out."
+    if current >= item["quantity"]:
+        return f"Only {item['quantity']} of {item['product_name']} in stock."
+    cart[item_id] = current + 1
+    st.session_state["last_receipt"] = None
+    return None
+
+
+def complete_sale(cart_lines: dict):
+    """Returns (ok, receipt_dict_or_list_of_problems). Stock is re-checked live,
+    decremented with a guard against concurrent sales, and rolled back if
+    logging the sale fails."""
+    ids = list(cart_lines.keys())
     fresh_rows = (
             supabase.table("inventory")
             .select("id,brand,product_name,quantity,price")
@@ -243,7 +347,7 @@ def complete_sale(cart: dict):
     fresh = {r["id"]: clean_item(r) for r in fresh_rows}
 
     problems = []
-    for iid, qty in cart.items():
+    for iid, qty in cart_lines.items():
         row = fresh.get(iid)
         label = inventory_by_id.get(iid, {}).get("product_name", f"Item {iid}")
         if row is None:
@@ -253,7 +357,7 @@ def complete_sale(cart: dict):
     if problems:
         return False, problems
 
-    subtotal = sum(fresh[iid]["price"] * qty for iid, qty in cart.items())
+    subtotal = round(sum(fresh[iid]["price"] * qty for iid, qty in cart_lines.items()), 2)
     grand_total = round(subtotal * (1 + TAX_RATE), 2)
     items_sold = [
         {
@@ -262,12 +366,12 @@ def complete_sale(cart: dict):
             "quantity": qty,
             "unit_price": fresh[iid]["price"],
         }
-        for iid, qty in cart.items()
+        for iid, qty in cart_lines.items()
     ]
 
     decremented = []  # (id, original_qty) for rollback
     try:
-        for iid, qty in cart.items():
+        for iid, qty in cart_lines.items():
             current = fresh[iid]["quantity"]
             res = (
                 supabase.table("inventory")
@@ -293,7 +397,12 @@ def complete_sale(cart: dict):
                 pass
         return False, [str(exc)]
 
-    return True, grand_total
+    return True, {
+        "items": items_sold,
+        "subtotal": subtotal,
+        "tax": round(grand_total - subtotal, 2),
+        "total": grand_total,
+    }
 
 
 # =====================================================================
@@ -304,73 +413,142 @@ with st.sidebar:
 
     with st.expander("🔐 Access Control", expanded=not is_admin):
         if is_admin:
-            st.success("Authenticated as Admin")
-            if st.button("Log Out", type="secondary", width="stretch"):
+            st.success("Signed in as Admin")
+            if st.button("🚪 Log Out", type="secondary", width="stretch"):
                 st.session_state["is_admin"] = False
                 st.rerun()
         else:
-            user = st.text_input("Username", key="login_user")
-            pwd = st.text_input("Password", type="password", key="login_pass")
-            if st.button("Log In", type="primary", width="stretch"):
+            # A form lets Enter submit the login
+            with st.form("login_form", border=False):
+                user = st.text_input("Username", key="login_user")
+                pwd = st.text_input("Password", type="password", key="login_pass")
+                login_clicked = st.form_submit_button("🔑 Log In", type="primary", width="stretch")
+            if login_clicked:
                 ok_user = hmac.compare_digest(user.encode(), str(ADMIN_USERNAME).encode())
                 ok_pass = hmac.compare_digest(pwd.encode(), str(ADMIN_PASSWORD).encode())
                 if ok_user and ok_pass:
                     st.session_state["is_admin"] = True
                     st.rerun()
                 else:
-                    st.error("Invalid credentials.")
+                    st.error("Invalid username or password.")
 
     st.divider()
 
     if is_admin:
+        # Always-visible cart summary so the cashier never has to remember it
+        cart_units = sum(cart.values())
+        cart_sub = sum(inventory_by_id[i]["price"] * q for i, q in cart.items())
+        st.markdown(
+            f"🛒 **Cart:** {cart_units} item{'s' if cart_units != 1 else ''} · "
+            f"{money(cart_sub * (1 + TAX_RATE))} incl. tax"
+        )
+        st.divider()
+
         st.subheader("➕ Add New Product")
         n = st.session_state["form_nonce"]
 
-        brand_choice = st.selectbox("Brand Name", [NEW_BRAND] + existing_brands, key=f"add_brand_select_{n}")
-        if brand_choice == NEW_BRAND:
-            brand = st.text_input("Enter New Brand", placeholder="e.g., Fenty Beauty",
-                                  key=f"add_brand_custom_{n}").strip()
-        else:
-            brand = brand_choice
+        # Type to search existing entries, or type a new one and press Enter.
+        # Matching is case-insensitive, so "fenty beauty" reuses "Fenty Beauty".
+        with st.form(f"add_form_{n}", border=False):
+            brand_in = st.selectbox(
+                "Brand Name",
+                options=existing_brands,
+                index=None,
+                accept_new_options=True,
+                placeholder="Select a brand or type a new one",
+                help="Not in the list? Type it and press Enter. Capitalisation is matched automatically.",
+                key=f"add_brand_{n}",
+            )
+            name_in = st.selectbox(
+                "Product Name",
+                options=existing_names,
+                index=None,
+                accept_new_options=True,
+                placeholder="Select a product or type a new one",
+                key=f"add_name_{n}",
+            )
+            category_in = st.selectbox("Target Area", CATEGORIES, key=f"add_cat_{n}")
+            tone_in = st.selectbox(
+                "Tone / Shade",
+                options=existing_tones,
+                index=None,
+                accept_new_options=True,
+                placeholder="Select a shade or type a new one",
+                key=f"add_tone_{n}",
+            )
+            qty_in = st.number_input("Stock Quantity", min_value=0, step=1, value=1, key=f"add_qty_{n}")
+            price_in = st.number_input(
+                "Retail Price", min_value=0.0, step=0.5, value=0.0, format="%.2f", key=f"add_price_{n}"
+            )
+            file_in = st.file_uploader(
+                "Product Image (optional)", type=["png", "jpg", "jpeg", "webp"], key=f"add_img_{n}"
+            )
+            add_clicked = st.form_submit_button("💾 Save New Product", type="primary", width="stretch")
 
-        name_choice = st.selectbox("Product Name", [NEW_NAME] + existing_names, key=f"add_name_select_{n}")
-        if name_choice == NEW_NAME:
-            name = st.text_input("Enter New Product Name", placeholder="e.g., Foundation",
-                                 key=f"add_name_custom_{n}").strip()
-        else:
-            name = name_choice
+        if add_clicked:
+            brand, name, tone = normalize_fields(brand_in, name_in, tone_in)
+            dup = find_duplicate(brand, name, tone)
+            if dup:
+                # Error prevention: don't create a second identical row
+                st.session_state["dup_pending"] = {"id": dup["id"], "qty": int(qty_in or 0)}
+            else:
+                st.session_state["dup_pending"] = None
+                with st.spinner("Saving…"):
+                    image_url = None
+                    if file_in is not None:
+                        try:
+                            image_url = upload_image(file_in, brand, name)
+                        except Exception as img_err:
+                            st.warning(f"Image upload failed, saving without image: {img_err}")
+                    data = {
+                        "brand": brand,
+                        "product_name": name,
+                        "category": category_in,
+                        "tone": tone,
+                        "quantity": int(qty_in or 0),
+                        "price": float(price_in or 0.0),
+                        "image_url": image_url,
+                    }
+                    try:
+                        supabase.table("inventory").insert(data).execute()
+                        note = " — price is 0.00, remember to set it" if not price_in else ""
+                        st.session_state["form_nonce"] += 1  # clears the form
+                        st.toast(f"Saved {brand} — {name}{note}", icon="✅" if price_in else "⚠️")
+                        st.rerun()
+                    except Exception as db_err:
+                        st.error(f"Could not save the product: {db_err}")
 
-        category = st.selectbox("Target Area", CATEGORIES, key=f"add_cat_{n}")
-        tone = st.text_input("Tone / Shade", placeholder="e.g., Warm Nude", key=f"add_tone_{n}").strip()
-        qty = st.number_input("Stock Quantity", min_value=0, step=1, value=1, key=f"add_qty_{n}")
-        price = st.number_input("Retail Price", min_value=0.0, step=0.5, value=0.0, format="%.2f", key=f"add_price_{n}")
-        uploaded_file = st.file_uploader("Product Image (optional)", type=["png", "jpg", "jpeg", "webp"],
-                                         key=f"add_img_{n}")
-
-        if st.button("Save New Product", type="primary", width="stretch"):
-            image_url = None
-            if uploaded_file is not None:
-                try:
-                    image_url = upload_image(uploaded_file, brand or "item", name or "product")
-                except Exception as img_err:
-                    st.warning(f"Image upload failed, saving without image: {img_err}")
-
-            data = {
-                "brand": brand or "N/A",
-                "product_name": name or "Unnamed Item",
-                "category": category,
-                "tone": tone or "N/A",
-                "quantity": int(qty or 0),
-                "price": float(price or 0.0),
-                "image_url": image_url,
-            }
-            try:
-                supabase.table("inventory").insert(data).execute()
-                st.session_state["form_nonce"] += 1  # clears the form
-                st.toast("Saved to database!", icon="✅")
-                st.rerun()
-            except Exception as db_err:
-                st.error(f"Database Error: {db_err}")
+        pend = st.session_state["dup_pending"]
+        if pend:
+            existing = inventory_by_id.get(pend["id"])
+            if existing is None:
+                st.session_state["dup_pending"] = None
+            else:
+                st.warning(
+                    f"**{label_of(existing)}** already exists ({existing['quantity']} in stock). "
+                    "Add to its stock instead?"
+                )
+                d1, d2 = st.columns(2)
+                if d1.button(
+                        f"➕ Add {pend['qty']} to stock",
+                        key="dup_add",
+                        type="primary",
+                        width="stretch",
+                        disabled=pend["qty"] <= 0,
+                ):
+                    try:
+                        supabase.table("inventory").update(
+                            {"quantity": existing["quantity"] + pend["qty"]}
+                        ).eq("id", existing["id"]).execute()
+                        st.session_state["dup_pending"] = None
+                        st.session_state["form_nonce"] += 1
+                        st.toast(f"Added {pend['qty']} to {existing['product_name']}", icon="✅")
+                        st.rerun()
+                    except Exception as err:
+                        st.error(f"Could not update stock: {err}")
+                if d2.button("✖ Dismiss", key="dup_dismiss", width="stretch"):
+                    st.session_state["dup_pending"] = None
+                    st.rerun()
     else:
         st.info("💡 **Viewer Mode**: Log in as Admin above to add, edit, or delete inventory.")
 
@@ -378,6 +556,22 @@ with st.sidebar:
 # HEADER
 # =====================================================================
 st.title("✨ Muse & Mirrors Studio POS")
+
+# Undo banner (keeps users in control and makes deletes reversible)
+if is_admin and st.session_state["last_deleted"]:
+    gone = clean_item(st.session_state["last_deleted"])
+    u1, u2, u3 = st.columns([6, 1.3, 1.3])
+    u1.info(f"🗑️ Deleted **{gone['brand']} — {gone['product_name']}**. Changed your mind?")
+    if u2.button("↩️ Undo", key="undo_delete", type="primary", width="stretch"):
+        try:
+            undo_delete()
+            st.toast("Item restored", icon="↩️")
+            st.rerun()
+        except Exception as err:
+            st.error(f"Could not restore the item: {err}")
+    if u3.button("✖ Dismiss", key="undo_dismiss", width="stretch"):
+        st.session_state["last_deleted"] = None
+        st.rerun()
 
 tab_pos, tab_catalog, tab_manage, tab_analytics = st.tabs(
     ["🛒 Checkout POS", "🖼️ Visual Catalog", "⚙️ Edit & Delete (Admin)", "📈 Sales & Revenue"]
@@ -394,11 +588,31 @@ with tab_pos:
 
         with pos_col1:
             st.subheader("Select Products")
-            pos_search = st.text_input("🔍 Search product or brand name...", key="pos_search").strip().lower()
+
+            # Expert shortcut: type a name, pick it, it's in the cart
+            in_stock = [i for i in inventory_items if i["quantity"] > 0]
+            quick = st.selectbox(
+                "⚡ Quick add",
+                options=[i["id"] for i in in_stock],
+                index=None,
+                format_func=lambda iid: label_of(inventory_by_id[iid]),
+                placeholder="Type a name and press Enter to add instantly",
+                key=f"quick_add_{st.session_state['quick_nonce']}",
+            )
+            if quick is not None:
+                msg = add_to_cart(quick)
+                st.session_state["quick_nonce"] += 1
+                if msg:
+                    st.toast(msg, icon="⚠️")
+                st.rerun()
+
+            pos_search = tidy(st.text_input("🔍 Search product or brand name...", key="pos_search")).lower()
             pos_items = [i for i in inventory_items if matches(i, pos_search)]
 
-            if not pos_items:
-                st.info("No products match your search.")
+            if not inventory_items:
+                st.info("No products yet. Add your first one from the sidebar.")
+            elif not pos_items:
+                st.info("No products match your search. Try a shorter name or clear the box.")
 
             grid_cols = st.columns(2)
             for idx, item in enumerate(pos_items):
@@ -406,26 +620,47 @@ with tab_pos:
                     with st.container(border=True, key=f"card_pos_{item['id']}"):
                         st.markdown(f"**{esc(item['brand'])}** - {esc(item['product_name'])}")
                         st.markdown(
-                            f"{status_badge(item['quantity'])} "
-                            f"<span class='price-tag'>${item['price']:.2f}</span> &nbsp;|&nbsp; Stock: {item['quantity']}",
+                            f"<span class='badge category-badge'>{esc(item['category'])}</span>"
+                            f"<span class='badge shade-badge'>Shade: {esc(item['tone'])}</span>",
                             unsafe_allow_html=True,
                         )
+                        st.markdown(
+                            f"{status_badge(item['quantity'])}<br>"
+                            f"<span class='price-tag'>{money(item['price'])}</span> &nbsp;|&nbsp; Stock: {item['quantity']}",
+                            unsafe_allow_html=True,
+                        )
+                        if cart.get(item["id"]):
+                            st.caption(f"🛒 {cart[item['id']]} in cart")
                         if item["quantity"] > 0:
                             if st.button("➕ Add to Cart", key=f"add_cart_{item['id']}", width="stretch"):
-                                in_cart = st.session_state["cart"].get(item["id"], 0)
-                                if in_cart < item["quantity"]:
-                                    st.session_state["cart"][item["id"]] = in_cart + 1
-                                    st.rerun()
+                                msg = add_to_cart(item["id"])
+                                if msg:
+                                    st.toast(msg, icon="⚠️")
                                 else:
-                                    st.warning("Stock limit reached!")
+                                    st.rerun()
                         else:
-                            st.button("Sold Out", key=f"soldout_{item['id']}", disabled=True, width="stretch")
+                            st.button("✕ Sold Out", key=f"soldout_{item['id']}", disabled=True, width="stretch")
 
         with pos_col2:
             st.subheader("Active Order")
-            cart = st.session_state["cart"]
             if not cart:
-                st.info("Cart is empty.")
+                receipt = st.session_state["last_receipt"]
+                if receipt:
+                    st.success(f"✅ Sale complete — {money(receipt['total'])}")
+                    for line in receipt["items"]:
+                        st.write(
+                            f"{line['brand']} {line['product_name']} × {line['quantity']} "
+                            f"— {money(line['unit_price'] * line['quantity'])}"
+                        )
+                    st.caption(
+                        f"Subtotal {money(receipt['subtotal'])} · Tax {money(receipt['tax'])} · "
+                        f"Total {money(receipt['total'])}"
+                    )
+                    if st.button("🆕 Start new order", type="primary", width="stretch"):
+                        st.session_state["last_receipt"] = None
+                        st.rerun()
+                else:
+                    st.info("Cart is empty. Tap **Add to Cart** on a product, or use Quick add.")
             else:
                 subtotal = 0.0
                 for item_id, qty in list(cart.items()):
@@ -433,31 +668,52 @@ with tab_pos:
                     line_total = qty * item["price"]
                     subtotal += line_total
 
-                    st.write(f"**{item['brand']} - {item['product_name']}**")
-                    c1, c2, c3 = st.columns([2, 2, 1])
-                    c1.write(f"${item['price']:.2f} x {qty}")
-                    c2.write(f"**${line_total:.2f}**")
-                    if c3.button("❌", key=f"remove_cart_{item_id}"):
-                        del st.session_state["cart"][item_id]
+                    st.markdown(f"**{esc(item['brand'])} - {esc(item['product_name'])}**")
+                    st.caption(f"Shade: {item['tone']} · {money(item['price'])} each")
+                    c_minus, c_qty, c_plus, c_del, c_total = st.columns([1, 1, 1, 1, 2])
+                    if c_minus.button("➖", key=f"minus_{item_id}", help="Remove one"):
+                        if qty > 1:
+                            cart[item_id] = qty - 1
+                        else:
+                            del cart[item_id]
                         st.rerun()
+                    c_qty.markdown(f"<div style='text-align:center;padding-top:8px'><b>{qty}</b></div>",
+                                   unsafe_allow_html=True)
+                    if c_plus.button("➕", key=f"plus_{item_id}", help="Add one"):
+                        msg = add_to_cart(item_id)
+                        if msg:
+                            st.toast(msg, icon="⚠️")
+                        else:
+                            st.rerun()
+                    if c_del.button("🗑️", key=f"remove_cart_{item_id}", help="Remove from cart"):
+                        del cart[item_id]
+                        st.rerun()
+                    c_total.markdown(f"<div style='text-align:right;padding-top:8px'><b>{money(line_total)}</b></div>",
+                                     unsafe_allow_html=True)
                     st.divider()
 
                 tax = subtotal * TAX_RATE
                 grand_total = subtotal + tax
-                st.write(f"**Subtotal:** ${subtotal:,.2f}")
-                st.write(f"**Tax ({TAX_RATE:.0%}):** ${tax:,.2f}")
-                st.markdown(f"### Grand Total: `${grand_total:,.2f}`")
+                st.write(f"**Subtotal:** {money(subtotal)}")
+                st.write(f"**Tax ({TAX_RATE:.0%}):** {money(tax)}")
+                st.markdown(f"### Grand Total: `{money(grand_total)}`")
 
-                if st.button("💳 Complete Transaction", type="primary", width="stretch"):
-                    ok, result = complete_sale(st.session_state["cart"])
+                b_clear, b_pay = st.columns([1, 2])
+                if b_clear.button("🧹 Clear", key="clear_cart", width="stretch", help="Empty the cart"):
+                    cart.clear()
+                    st.rerun()
+                if b_pay.button("💳 Complete Transaction", type="primary", width="stretch"):
+                    with st.spinner("Recording sale…"):
+                        ok, result = complete_sale(cart)
                     if ok:
                         st.session_state["cart"] = {}
+                        st.session_state["last_receipt"] = result
                         st.balloons()
-                        st.toast(f"Transaction recorded: ${result:,.2f}", icon="✅")
                         st.rerun()
                     else:
                         for msg in result:
                             st.error(msg)
+                        st.caption("Nothing was charged. Adjust the cart and try again.")
 
 # =====================================================================
 # TAB 2: VISUAL CATALOG
@@ -465,7 +721,7 @@ with tab_pos:
 with tab_catalog:
     f1, f2, f3 = st.columns([3, 1, 1])
     with f1:
-        cat_search = st.text_input("🔍 Search catalog by brand or product name...", key="cat_search").strip().lower()
+        cat_search = tidy(st.text_input("🔍 Search catalog by brand or product name...", key="cat_search")).lower()
     with f2:
         area_filter = st.selectbox("Target Area", ["All"] + CATEGORIES, key="cat_area")
     with f3:
@@ -479,8 +735,12 @@ with tab_catalog:
     elif status_filter == "Sold Out":
         filtered = [i for i in filtered if i["quantity"] <= 0]
 
-    if not filtered:
-        st.info("No items match your query.")
+    st.caption(f"Showing {len(filtered)} of {len(inventory_items)} products")
+
+    if not inventory_items:
+        st.info("The catalog is empty. Products will appear here once they're added.")
+    elif not filtered:
+        st.info("No items match your filters. Try clearing the search or setting filters back to All.")
     else:
         per_row = 3
         for start in range(0, len(filtered), per_row):
@@ -502,14 +762,14 @@ with tab_catalog:
                             unsafe_allow_html=True,
                         )
                         st.markdown(
-                            f"<span class='price-tag'>${item['price']:.2f}</span> &nbsp;|&nbsp; Stock: {item['quantity']}",
+                            f"<span class='price-tag'>{money(item['price'])}</span> &nbsp;|&nbsp; Stock: {item['quantity']}",
                             unsafe_allow_html=True,
                         )
                         if is_admin:
-                            if st.button("🗑️ Quick Delete", key=f"quick_del_{item['id']}", width="stretch"):
+                            if st.button("🗑️ Quick Delete", key=f"quick_del_{item['id']}", width="stretch",
+                                         help="You can undo this right after"):
                                 try:
                                     delete_item(item)
-                                    st.toast("Deleted!", icon="🗑️")
                                     st.rerun()
                                 except Exception as del_err:
                                     st.error(f"Failed to delete: {del_err}")
@@ -521,7 +781,7 @@ with tab_manage:
     if not is_admin:
         st.warning("🔒 You must log in as Admin via the sidebar to access edit and delete tools.")
     elif not inventory_items:
-        st.info("No inventory items found to edit.")
+        st.info("No inventory items found to edit. Add one from the sidebar.")
     else:
         st.subheader("📝 Edit or Delete Existing Inventory Items")
 
@@ -529,65 +789,97 @@ with tab_manage:
         selected_id = st.selectbox(
             "Select Product to Modify",
             options=[i["id"] for i in inventory_items],
-            format_func=lambda iid: (
-                f"{inventory_by_id[iid]['brand']} — {inventory_by_id[iid]['product_name']} "
-                f"({inventory_by_id[iid]['tone']})"
-            ),
+            format_func=lambda iid: label_of(inventory_by_id[iid]),
             key="manage_select",
         )
         sel = inventory_by_id[selected_id]
         k = sel["id"]
+        en = st.session_state.get(f"edit_nonce_{k}", 0)  # bump to reset the form to saved values
+        ek = f"{k}_{en}"
 
         st.markdown("---")
-        st.write(f"Editing: **{sel['brand']} - {sel['product_name']}**")
+        st.write(
+            f"Editing: **{sel['brand']} - {sel['product_name']}** · "
+            f"{sel['quantity']} in stock · {money(sel['price'])}"
+        )
+
+        brand_opts = dedupe_ci(existing_brands + [sel["brand"]])
+        name_opts = dedupe_ci(existing_names + [sel["product_name"]])
+        tone_opts = dedupe_ci(existing_tones + [sel["tone"]])
 
         e1, e2 = st.columns(2)
         with e1:
-            edit_brand = st.text_input("Brand", value=sel["brand"], key=f"edit_brand_{k}")
-            edit_name = st.text_input("Product Name", value=sel["product_name"], key=f"edit_name_{k}")
+            edit_brand = st.selectbox(
+                "Brand", brand_opts, index=idx_ci(brand_opts, sel["brand"]),
+                accept_new_options=True, key=f"edit_brand_{ek}",
+                help="Type to search, or type a new brand and press Enter.",
+            )
+            edit_name = st.selectbox(
+                "Product Name", name_opts, index=idx_ci(name_opts, sel["product_name"]),
+                accept_new_options=True, key=f"edit_name_{ek}",
+            )
             cat_idx = CATEGORIES.index(sel["category"]) if sel["category"] in CATEGORIES else 0
-            edit_category = st.selectbox("Target Area", CATEGORIES, index=cat_idx, key=f"edit_cat_{k}")
+            edit_category = st.selectbox("Target Area", CATEGORIES, index=cat_idx, key=f"edit_cat_{ek}")
         with e2:
-            edit_tone = st.text_input("Tone / Shade", value=sel["tone"], key=f"edit_tone_{k}")
+            edit_tone = st.selectbox(
+                "Tone / Shade", tone_opts, index=idx_ci(tone_opts, sel["tone"]),
+                accept_new_options=True, key=f"edit_tone_{ek}",
+            )
             edit_qty = st.number_input("Stock Quantity", min_value=0, step=1, value=sel["quantity"],
-                                       key=f"edit_qty_{k}")
-            edit_price = st.number_input("Retail Price", min_value=0.0, step=0.5, value=sel["price"], format="%.2f",
-                                         key=f"edit_price_{k}")
+                                       key=f"edit_qty_{ek}")
+            edit_price = st.number_input(
+                "Retail Price", min_value=0.0, step=0.5, value=sel["price"], format="%.2f", key=f"edit_price_{ek}"
+            )
 
         if sel["image_url"]:
             st.image(sel["image_url"], width=140, caption="Current image")
         new_image = st.file_uploader("Replace image (optional)", type=["png", "jpg", "jpeg", "webp"],
-                                     key=f"edit_img_{k}")
+                                     key=f"edit_img_{ek}")
 
-        b1, b2 = st.columns(2)
+        # Live validation: tell the user before they press Save
+        brand_n, name_n, tone_n = normalize_fields(edit_brand, edit_name, edit_tone)
+        update_data = {
+            "brand": brand_n,
+            "product_name": name_n,
+            "category": edit_category,
+            "tone": tone_n,
+            "quantity": int(edit_qty or 0),
+            "price": float(edit_price or 0.0),
+        }
+        changed = new_image is not None or any(update_data[f] != sel[f] for f in update_data)
+        clash = find_duplicate(brand_n, name_n, tone_n, exclude_id=k)
+
+        if clash:
+            st.warning(
+                f"Another item already uses this brand, product and shade: **{label_of(clash)}**. Change one of them to save.")
+        elif not changed:
+            st.caption("No changes yet.")
+
+        b1, b2, b3 = st.columns(3)
         with b1:
-            if st.button("💾 Save Changes", type="primary", width="stretch", key=f"save_btn_{k}"):
-                update_data = {
-                    "brand": edit_brand.strip() or "N/A",
-                    "product_name": edit_name.strip() or "Unnamed Item",
-                    "category": edit_category,
-                    "tone": edit_tone.strip() or "N/A",
-                    "quantity": int(edit_qty or 0),
-                    "price": float(edit_price or 0.0),
-                }
+            if st.button("💾 Save Changes", type="primary", width="stretch", key=f"save_btn_{k}",
+                         disabled=bool(clash) or not changed):
                 try:
-                    if new_image is not None:
-                        update_data["image_url"] = upload_image(new_image, update_data["brand"],
-                                                                update_data["product_name"])
-                    supabase.table("inventory").update(update_data).eq("id", k).execute()
-                    if new_image is not None:
-                        delete_image(sel["image_url"])
-                    st.toast("Product updated!", icon="✅")
+                    with st.spinner("Saving…"):
+                        if new_image is not None:
+                            update_data["image_url"] = upload_image(new_image, brand_n, name_n)
+                        supabase.table("inventory").update(update_data).eq("id", k).execute()
+                        if new_image is not None:
+                            delete_image(sel["image_url"])
+                    st.toast(f"Updated {brand_n} — {name_n}", icon="✅")
                     st.rerun()
                 except Exception as update_err:
                     st.error(f"Failed to update item: {update_err}")
         with b2:
-            confirm = st.checkbox("Confirm permanent delete", key=f"confirm_del_{k}")
-            if st.button("🗑️ Permanently Delete Item", type="secondary", width="stretch", key=f"full_del_btn_{k}",
-                         disabled=not confirm):
+            if st.button("↩️ Reset form", width="stretch", key=f"reset_btn_{k}", disabled=not changed,
+                         help="Discard unsaved edits"):
+                st.session_state[f"edit_nonce_{k}"] = en + 1
+                st.rerun()
+        with b3:
+            if st.button("🗑️ Delete Item", type="secondary", width="stretch", key=f"full_del_btn_{k}",
+                         help="You can undo this right after"):
                 try:
                     delete_item(sel)
-                    st.toast("Product permanently deleted!", icon="🗑️")
                     st.rerun()
                 except Exception as del_err:
                     st.error(f"Failed to delete item: {del_err}")
@@ -607,8 +899,8 @@ with tab_analytics:
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Unique Items", total_products)
         m2.metric("In-Stock Units", total_stock)
-        m3.metric("Inventory Value ($)", f"${total_inventory_val:,.2f}")
-        m4.metric("Total Revenue Realized ($)", f"${total_revenue:,.2f}")
+        m3.metric("Inventory Value ($)", money(total_inventory_val))
+        m4.metric("Total Revenue Realized ($)", money(total_revenue))
 
         st.divider()
         st.subheader("Completed Sales History")
@@ -641,4 +933,4 @@ with tab_analytics:
                 },
             )
         else:
-            st.info("No sales transactions recorded yet.")
+            st.info("No sales transactions recorded yet. Completed checkouts will show up here.")
