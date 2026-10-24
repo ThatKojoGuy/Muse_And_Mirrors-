@@ -3,6 +3,7 @@ import hmac
 import re
 import uuid
 from collections import Counter
+from datetime import datetime
 
 import pandas as pd
 import streamlit as st
@@ -67,6 +68,7 @@ st.markdown(
         backdrop-filter: blur(6px);
     }
     .category-badge { background: rgba(88, 166, 255, 0.15); color: #79B8FF; font-weight: 600; border: 1px solid rgba(88, 166, 255, 0.35); }
+    .type-badge { background: rgba(188, 140, 255, 0.15); color: #D2A8FF; font-weight: 600; border: 1px solid rgba(188, 140, 255, 0.35); }
     .shade-badge { background: rgba(139, 148, 158, 0.15); color: #C9D1D9; border: 1px solid rgba(139, 148, 158, 0.3); }
     .status-available { background: rgba(35, 134, 54, 0.2); color: #56D364; font-weight: 700; border: 1px solid #238636; }
     .status-low { background: rgba(210, 153, 34, 0.2); color: #E3B341; font-weight: 700; border: 1px solid #9E6A03; }
@@ -90,8 +92,15 @@ st.markdown(
 # CONSTANTS & HELPERS
 # =====================================================================
 CATEGORIES = ["Uncategorized", "Eyes", "Ears", "Nose", "Lips", "Cheeks", "Other"]
-TAX_RATE = 0.05
+# Suggested makeup types. Admins can type any new type and it is remembered.
+DEFAULT_TYPES = [
+    "Foundation", "Concealer", "Primer", "Powder", "Blush", "Bronzer", "Highlighter",
+    "Eyeshadow", "Eyeliner", "Mascara", "Brows", "Lipstick", "Lip Gloss", "Lip Liner",
+    "Setting Spray", "Skincare", "Tools & Brushes", "Other",
+]
+NO_TYPE = "Uncategorized"
 LOW_STOCK = 3
+GRID_COLUMNS = 4  # products per row in the Visual Catalog
 BUCKET = "product_images"
 
 
@@ -100,7 +109,7 @@ def esc(value) -> str:
 
 
 def money(value: float) -> str:
-    return f"${value:,.2f}"
+    return f"{value:,.2f}"
 
 
 def get_secret(name: str):
@@ -116,6 +125,7 @@ def clean_item(row: dict) -> dict:
         "id": row.get("id"),
         "brand": (row.get("brand") or "").strip() or "N/A",
         "product_name": (row.get("product_name") or "").strip() or "Unnamed Item",
+        "product_type": (row.get("product_type") or "").strip() or NO_TYPE,
         "category": row.get("category") or "Uncategorized",
         "tone": (row.get("tone") or "").strip() or "N/A",
         "quantity": int(row.get("quantity") or 0),
@@ -129,7 +139,11 @@ def label_of(item: dict) -> str:
 
 
 def matches(item: dict, query: str) -> bool:
-    return query in item["brand"].lower() or query in item["product_name"].lower()
+    """Every word typed must appear somewhere in brand, name, type, shade or area."""
+    hay = " ".join(
+        [item["brand"], item["product_name"], item["product_type"], item["tone"], item["category"]]
+    ).lower()
+    return all(word in hay for word in query.split())
 
 
 def status_badge(qty: int) -> str:
@@ -140,6 +154,12 @@ def status_badge(qty: int) -> str:
             out += f"<span class='badge status-low'>⚠ ONLY {qty} LEFT</span>"
         return out
     return "<span class='badge status-soldout'>✕ SOLD OUT</span>"
+
+
+def type_badge(item: dict) -> str:
+    if item["product_type"] == NO_TYPE:
+        return ""
+    return f"<span class='badge type-badge'>{esc(item['product_type'])}</span>"
 
 
 # ---- case-insensitive name handling ---------------------------------
@@ -182,6 +202,11 @@ SUPABASE_KEY = get_secret("SUPABASE_KEY")
 ADMIN_USERNAME = get_secret("ADMIN_USERNAME")
 ADMIN_PASSWORD = get_secret("ADMIN_PASSWORD")
 
+# Optional: printed at the top of every receipt (add to Streamlit Secrets to customise)
+BUSINESS_NAME = get_secret("BUSINESS_NAME") or "Muse & Mirrors Studio"
+BUSINESS_ADDRESS = get_secret("BUSINESS_ADDRESS") or ""
+BUSINESS_PHONE = get_secret("BUSINESS_PHONE") or ""
+
 missing = [
     n
     for n, v in {
@@ -219,17 +244,27 @@ for key, default in {
     "last_deleted": None,  # raw row, enables Undo
     "last_receipt": None,  # shown after a sale for closure
     "dup_pending": None,  # duplicate found while adding a product
+    "has_type": False,  # becomes True once the product_type column exists
 }.items():
     st.session_state.setdefault(key, default)
 
 is_admin = st.session_state["is_admin"]
+
+# Has the database been upgraded with the product_type column? (re-checked until it has)
+if not st.session_state["has_type"]:
+    try:
+        supabase.table("inventory").select("product_type").limit(1).execute()
+        st.session_state["has_type"] = True
+    except Exception:
+        st.session_state["has_type"] = False
+HAS_TYPE = st.session_state["has_type"]
 
 # =====================================================================
 # DATA
 # =====================================================================
 try:
     inv_rows = (
-            supabase.table("inventory").select("*").order("id", desc=True).execute().data or []
+        supabase.table("inventory").select("*").order("id", desc=True).execute().data or []
     )
 except Exception as err:
     st.error(f"Inventory fetch error: {err}")
@@ -243,7 +278,7 @@ sales_history = []
 if is_admin:  # sales/revenue are only loaded for admins
     try:
         sales_history = (
-                supabase.table("sales").select("*").order("id", desc=True).execute().data or []
+            supabase.table("sales").select("*").order("id", desc=True).execute().data or []
         )
     except Exception as err:
         st.error(f"Sales fetch error: {err}")
@@ -260,6 +295,162 @@ existing_names = dedupe_ci(
     i["product_name"] for i in inventory_items if i["product_name"] != "Unnamed Item"
 )
 existing_tones = dedupe_ci(i["tone"] for i in inventory_items if i["tone"] != "N/A")
+existing_types = dedupe_ci(
+    DEFAULT_TYPES + [i["product_type"] for i in inventory_items if i["product_type"] != NO_TYPE]
+)
+
+
+# =====================================================================
+# RECEIPTS
+# =====================================================================
+def build_receipt(sale: dict) -> dict:
+    """Turn a `sales` row into a printable receipt structure."""
+    created = pd.to_datetime(sale.get("created_at"), errors="coerce")
+    when = created.to_pydatetime() if pd.notna(created) else datetime.now()
+    lines = []
+    for li in sale.get("items_sold") or []:
+        qty = int(li.get("quantity") or 0)
+        unit = float(li.get("unit_price") or 0.0)
+        name = f"{li.get('brand', 'N/A')} - {li.get('product_name', '')}".strip(" -")
+        if li.get("tone") and li.get("tone") != "N/A":
+            name += f" ({li['tone']})"
+        lines.append({"name": name, "qty": qty, "unit": unit, "total": round(qty * unit, 2)})
+    sale_id = sale.get("id")
+    return {
+        "number": f"{int(sale_id):05d}" if sale_id is not None else "-----",
+        "date": when.strftime("%d %b %Y, %H:%M"),
+        "lines": lines,
+        "units": sum(line["qty"] for line in lines),
+        "total": round(float(sale.get("total_amount") or 0.0), 2),
+    }
+
+
+def receipt_html(r: dict) -> str:
+    """Self-contained, print-friendly receipt (open the file and press Ctrl/Cmd+P)."""
+    rows = "".join(
+        f"<tr><td>{esc(li['name'])}</td><td class='n'>{li['qty']}</td>"
+        f"<td class='n'>{money(li['unit'])}</td><td class='n'>{money(li['total'])}</td></tr>"
+        for li in r["lines"]
+    )
+    contact = "".join(f"<div>{esc(x)}</div>" for x in (BUSINESS_ADDRESS, BUSINESS_PHONE) if x)
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<title>Receipt {esc(r['number'])}</title>
+<style>
+ body{{font-family:Arial,Helvetica,sans-serif;max-width:420px;margin:24px auto;padding:0 12px;color:#111}}
+ h1{{font-size:20px;margin:0;text-align:center}} .c{{text-align:center;font-size:13px;color:#444}}
+ table{{width:100%;border-collapse:collapse;margin-top:14px;font-size:13px}}
+ th{{text-align:left;border-bottom:2px solid #111;padding:4px 0}} td{{padding:5px 0;border-bottom:1px solid #ddd}}
+ .n{{text-align:right;white-space:nowrap;padding-left:8px}} .t{{font-size:18px;font-weight:700;text-align:right;margin-top:12px}}
+ @media print{{body{{margin:0}}}}
+</style></head><body>
+<h1>{esc(BUSINESS_NAME)}</h1><div class="c">{contact}</div>
+<p class="c"><b>RECEIPT No. {esc(r['number'])}</b><br>{esc(r['date'])}</p>
+<table><tr><th>Item</th><th class="n">Qty</th><th class="n">Price</th><th class="n">Total</th></tr>{rows}</table>
+<div class="t">TOTAL {money(r['total'])}</div>
+<p class="c">{r['units']} item(s) &middot; Thank you for shopping with us!</p>
+</body></html>"""
+
+
+def receipt_pdf(r: dict):
+    """A5 PDF receipt. Returns bytes, or None if the PDF library isn't installed."""
+    try:
+        from fpdf import FPDF
+    except Exception:
+        return None
+
+    _plain = str.maketrans(
+        {"—": "-", "–": "-", "‘": "'", "’": "'", "“": '"', "”": '"', "…": "...", "×": "x", "•": "-"}
+    )
+
+    def t(s):  # the built-in PDF fonts are Latin-1 only
+        return str(s).translate(_plain).encode("latin-1", "replace").decode("latin-1")
+
+    pdf = FPDF(format="A5")
+    pdf.set_auto_page_break(True, 15)
+    pdf.add_page()
+    w = pdf.epw
+
+    def row(text, h=5, style="", size=9, align="L"):
+        pdf.set_font("Helvetica", style, size)
+        pdf.cell(w, h, t(text), align=align, new_x="LMARGIN", new_y="NEXT")
+
+    def rule():
+        pdf.ln(1)
+        pdf.line(pdf.l_margin, pdf.get_y(), pdf.l_margin + w, pdf.get_y())
+        pdf.ln(2)
+
+    row(BUSINESS_NAME, h=9, style="B", size=16, align="C")
+    for extra in (BUSINESS_ADDRESS, BUSINESS_PHONE):
+        if extra:
+            row(extra, align="C")
+    pdf.ln(3)
+    row("RECEIPT", h=7, style="B", size=12, align="C")
+    row(f"No. {r['number']}   |   {r['date']}", align="C")
+    rule()
+    for li in r["lines"]:
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.multi_cell(w, 5, t(li["name"]), new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("Helvetica", "", 9)
+        pdf.cell(w * 0.6, 5, t(f"{li['qty']} x {money(li['unit'])}"))
+        pdf.cell(w * 0.4, 5, t(money(li["total"])), align="R", new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(1)
+    rule()
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.cell(w * 0.5, 8, "TOTAL")
+    pdf.cell(w * 0.5, 8, t(money(r["total"])), align="R", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(4)
+    row(f"{r['units']} item(s)  -  Thank you for shopping with us!", align="C")
+    return bytes(pdf.output())
+
+
+def render_receipt(r: dict, prefix: str):
+    """On-screen receipt with download buttons."""
+    with st.container(border=True, key=f"card_receipt_{prefix}"):
+        st.markdown(f"#### 🧾 {esc(BUSINESS_NAME)}")
+        sub = " · ".join(x for x in (BUSINESS_ADDRESS, BUSINESS_PHONE) if x)
+        if sub:
+            st.caption(sub)
+        st.markdown(f"**Receipt No. {esc(r['number'])}** · {esc(r['date'])}")
+        df = pd.DataFrame(
+            {
+                "Item": [li["name"] for li in r["lines"]],
+                "Qty": [li["qty"] for li in r["lines"]],
+                "Price": [li["unit"] for li in r["lines"]],
+                "Total": [li["total"] for li in r["lines"]],
+            }
+        )
+        st.dataframe(
+            df,
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "Price": st.column_config.NumberColumn(format="%.2f"),
+                "Total": st.column_config.NumberColumn(format="%.2f"),
+            },
+        )
+        st.markdown(f"### Total: `{money(r['total'])}`")
+        st.caption(f"{r['units']} item(s) · Thank you for shopping with us!")
+
+        d1, d2 = st.columns(2)
+        pdf_bytes = receipt_pdf(r)
+        if pdf_bytes:
+            d1.download_button(
+                "⬇️ Download PDF",
+                data=pdf_bytes,
+                file_name=f"receipt-{r['number']}.pdf",
+                mime="application/pdf",
+                width="stretch",
+                key=f"dl_pdf_{prefix}",
+            )
+        d2.download_button(
+            "🖨️ Printable page (HTML)",
+            data=receipt_html(r),
+            file_name=f"receipt-{r['number']}.html",
+            mime="text/html",
+            width="stretch",
+            key=f"dl_html_{prefix}",
+            help="Open the file and press Ctrl/Cmd + P to print.",
+        )
 
 
 # =====================================================================
@@ -273,13 +464,24 @@ def normalize_fields(brand_raw, name_raw, tone_raw):
     return brand, name, tone
 
 
+def normalize_type(type_raw) -> str:
+    return canon(type_raw, existing_types) or NO_TYPE
+
+
+def with_type(data: dict, product_type: str) -> dict:
+    """Only send product_type once the database has that column."""
+    if HAS_TYPE:
+        data["product_type"] = product_type
+    return data
+
+
 def find_duplicate(brand, name, tone, exclude_id=None):
     key = (brand.lower(), name.lower(), tone.lower())
     for i in inventory_items:
         if i["id"] != exclude_id and (
-                i["brand"].lower(),
-                i["product_name"].lower(),
-                i["tone"].lower(),
+            i["brand"].lower(),
+            i["product_name"].lower(),
+            i["tone"].lower(),
         ) == key:
             return i
     return None
@@ -337,12 +539,12 @@ def complete_sale(cart_lines: dict):
     logging the sale fails."""
     ids = list(cart_lines.keys())
     fresh_rows = (
-            supabase.table("inventory")
-            .select("id,brand,product_name,quantity,price")
-            .in_("id", ids)
-            .execute()
-            .data
-            or []
+        supabase.table("inventory")
+        .select("id,brand,product_name,tone,quantity,price")
+        .in_("id", ids)
+        .execute()
+        .data
+        or []
     )
     fresh = {r["id"]: clean_item(r) for r in fresh_rows}
 
@@ -357,12 +559,12 @@ def complete_sale(cart_lines: dict):
     if problems:
         return False, problems
 
-    subtotal = round(sum(fresh[iid]["price"] * qty for iid, qty in cart_lines.items()), 2)
-    grand_total = round(subtotal * (1 + TAX_RATE), 2)
+    total = round(sum(fresh[iid]["price"] * qty for iid, qty in cart_lines.items()), 2)
     items_sold = [
         {
             "brand": fresh[iid]["brand"],
             "product_name": fresh[iid]["product_name"],
+            "tone": fresh[iid]["tone"],
             "quantity": qty,
             "unit_price": fresh[iid]["price"],
         }
@@ -370,6 +572,7 @@ def complete_sale(cart_lines: dict):
     ]
 
     decremented = []  # (id, original_qty) for rollback
+    sale_row = {}
     try:
         for iid, qty in cart_lines.items():
             current = fresh[iid]["quantity"]
@@ -386,9 +589,10 @@ def complete_sale(cart_lines: dict):
                 )
             decremented.append((iid, current))
 
-        supabase.table("sales").insert(
-            {"total_amount": grand_total, "items_sold": items_sold}
+        ins = supabase.table("sales").insert(
+            {"total_amount": total, "items_sold": items_sold}
         ).execute()
+        sale_row = (ins.data or [{}])[0]
     except Exception as exc:
         for iid, original in decremented:
             try:
@@ -397,12 +601,38 @@ def complete_sale(cart_lines: dict):
                 pass
         return False, [str(exc)]
 
-    return True, {
-        "items": items_sold,
-        "subtotal": subtotal,
-        "tax": round(grand_total - subtotal, 2),
-        "total": grand_total,
-    }
+    sale_row.setdefault("total_amount", total)
+    sale_row.setdefault("items_sold", items_sold)
+    return True, build_receipt(sale_row)
+
+
+# =====================================================================
+# FILTER HELPERS
+# =====================================================================
+def type_pills(key: str) -> list:
+    """Clickable makeup-type chips (with counts). Nothing selected = show all."""
+    if not HAS_TYPE:
+        return []
+    counts = Counter(i["product_type"] for i in inventory_items)
+    options = sorted(counts, key=str.lower)
+    if len(options) < 2:
+        return []
+    picked = st.pills(
+        "Makeup type",
+        options,
+        selection_mode="multi",
+        format_func=lambda t: f"{t} ({counts[t]})",
+        key=key,
+        help="Pick one or more types. Leave empty to show everything.",
+    )
+    return list(picked or [])
+
+
+def reset_catalog_filters():
+    st.session_state["cat_search"] = ""
+    st.session_state["cat_area"] = "All"
+    st.session_state["cat_status"] = "All"
+    st.session_state["cat_types"] = []
 
 
 # =====================================================================
@@ -437,10 +667,9 @@ with st.sidebar:
     if is_admin:
         # Always-visible cart summary so the cashier never has to remember it
         cart_units = sum(cart.values())
-        cart_sub = sum(inventory_by_id[i]["price"] * q for i, q in cart.items())
+        cart_total = sum(inventory_by_id[i]["price"] * q for i, q in cart.items())
         st.markdown(
-            f"🛒 **Cart:** {cart_units} item{'s' if cart_units != 1 else ''} · "
-            f"{money(cart_sub * (1 + TAX_RATE))} incl. tax"
+            f"🛒 **Cart:** {cart_units} item{'s' if cart_units != 1 else ''} · {money(cart_total)}"
         )
         st.divider()
 
@@ -467,6 +696,16 @@ with st.sidebar:
                 placeholder="Select a product or type a new one",
                 key=f"add_name_{n}",
             )
+            type_in = st.selectbox(
+                "Makeup Type",
+                options=existing_types,
+                index=None,
+                accept_new_options=True,
+                placeholder="e.g., Foundation, Lipstick, Mascara",
+                help="Used to filter the catalog and POS. Type a new type and press Enter to create it.",
+                key=f"add_type_{n}",
+                disabled=not HAS_TYPE,
+            )
             category_in = st.selectbox("Target Area", CATEGORIES, key=f"add_cat_{n}")
             tone_in = st.selectbox(
                 "Tone / Shade",
@@ -487,6 +726,7 @@ with st.sidebar:
 
         if add_clicked:
             brand, name, tone = normalize_fields(brand_in, name_in, tone_in)
+            ptype = normalize_type(type_in)
             dup = find_duplicate(brand, name, tone)
             if dup:
                 # Error prevention: don't create a second identical row
@@ -500,15 +740,18 @@ with st.sidebar:
                             image_url = upload_image(file_in, brand, name)
                         except Exception as img_err:
                             st.warning(f"Image upload failed, saving without image: {img_err}")
-                    data = {
-                        "brand": brand,
-                        "product_name": name,
-                        "category": category_in,
-                        "tone": tone,
-                        "quantity": int(qty_in or 0),
-                        "price": float(price_in or 0.0),
-                        "image_url": image_url,
-                    }
+                    data = with_type(
+                        {
+                            "brand": brand,
+                            "product_name": name,
+                            "category": category_in,
+                            "tone": tone,
+                            "quantity": int(qty_in or 0),
+                            "price": float(price_in or 0.0),
+                            "image_url": image_url,
+                        },
+                        ptype,
+                    )
                     try:
                         supabase.table("inventory").insert(data).execute()
                         note = " — price is 0.00, remember to set it" if not price_in else ""
@@ -530,11 +773,11 @@ with st.sidebar:
                 )
                 d1, d2 = st.columns(2)
                 if d1.button(
-                        f"➕ Add {pend['qty']} to stock",
-                        key="dup_add",
-                        type="primary",
-                        width="stretch",
-                        disabled=pend["qty"] <= 0,
+                    f"➕ Add {pend['qty']} to stock",
+                    key="dup_add",
+                    type="primary",
+                    width="stretch",
+                    disabled=pend["qty"] <= 0,
                 ):
                     try:
                         supabase.table("inventory").update(
@@ -556,6 +799,12 @@ with st.sidebar:
 # HEADER
 # =====================================================================
 st.title("✨ Muse & Mirrors Studio POS")
+
+if is_admin and not HAS_TYPE:
+    st.warning(
+        "⚙️ **One-time database update needed:** the *Makeup Type* feature needs a new column. "
+        "Run the latest `setup.sql` in the Supabase SQL Editor, then refresh this page."
+    )
 
 # Undo banner (keeps users in control and makes deletes reversible)
 if is_admin and st.session_state["last_deleted"]:
@@ -606,13 +855,19 @@ with tab_pos:
                     st.toast(msg, icon="⚠️")
                 st.rerun()
 
-            pos_search = tidy(st.text_input("🔍 Search product or brand name...", key="pos_search")).lower()
-            pos_items = [i for i in inventory_items if matches(i, pos_search)]
+            pos_search = tidy(
+                st.text_input("🔍 Search brand, product, type or shade...", key="pos_search")
+            ).lower()
+            pos_types = type_pills("pos_types")
+            pos_items = [
+                i for i in inventory_items
+                if matches(i, pos_search) and (not pos_types or i["product_type"] in pos_types)
+            ]
 
             if not inventory_items:
                 st.info("No products yet. Add your first one from the sidebar.")
             elif not pos_items:
-                st.info("No products match your search. Try a shorter name or clear the box.")
+                st.info("No products match. Try a shorter search or clear the type filter.")
 
             grid_cols = st.columns(2)
             for idx, item in enumerate(pos_items):
@@ -620,6 +875,7 @@ with tab_pos:
                     with st.container(border=True, key=f"card_pos_{item['id']}"):
                         st.markdown(f"**{esc(item['brand'])}** - {esc(item['product_name'])}")
                         st.markdown(
+                            f"{type_badge(item)}"
                             f"<span class='badge category-badge'>{esc(item['category'])}</span>"
                             f"<span class='badge shade-badge'>Shade: {esc(item['tone'])}</span>",
                             unsafe_allow_html=True,
@@ -647,26 +903,18 @@ with tab_pos:
                 receipt = st.session_state["last_receipt"]
                 if receipt:
                     st.success(f"✅ Sale complete — {money(receipt['total'])}")
-                    for line in receipt["items"]:
-                        st.write(
-                            f"{line['brand']} {line['product_name']} × {line['quantity']} "
-                            f"— {money(line['unit_price'] * line['quantity'])}"
-                        )
-                    st.caption(
-                        f"Subtotal {money(receipt['subtotal'])} · Tax {money(receipt['tax'])} · "
-                        f"Total {money(receipt['total'])}"
-                    )
+                    render_receipt(receipt, "latest")
                     if st.button("🆕 Start new order", type="primary", width="stretch"):
                         st.session_state["last_receipt"] = None
                         st.rerun()
                 else:
                     st.info("Cart is empty. Tap **Add to Cart** on a product, or use Quick add.")
             else:
-                subtotal = 0.0
+                total = 0.0
                 for item_id, qty in list(cart.items()):
                     item = inventory_by_id[item_id]
                     line_total = qty * item["price"]
-                    subtotal += line_total
+                    total += line_total
 
                     st.markdown(f"**{esc(item['brand'])} - {esc(item['product_name'])}**")
                     st.caption(f"Shade: {item['tone']} · {money(item['price'])} each")
@@ -677,8 +925,7 @@ with tab_pos:
                         else:
                             del cart[item_id]
                         st.rerun()
-                    c_qty.markdown(f"<div style='text-align:center;padding-top:8px'><b>{qty}</b></div>",
-                                   unsafe_allow_html=True)
+                    c_qty.markdown(f"<div style='text-align:center;padding-top:8px'><b>{qty}</b></div>", unsafe_allow_html=True)
                     if c_plus.button("➕", key=f"plus_{item_id}", help="Add one"):
                         msg = add_to_cart(item_id)
                         if msg:
@@ -688,15 +935,10 @@ with tab_pos:
                     if c_del.button("🗑️", key=f"remove_cart_{item_id}", help="Remove from cart"):
                         del cart[item_id]
                         st.rerun()
-                    c_total.markdown(f"<div style='text-align:right;padding-top:8px'><b>{money(line_total)}</b></div>",
-                                     unsafe_allow_html=True)
+                    c_total.markdown(f"<div style='text-align:right;padding-top:8px'><b>{money(line_total)}</b></div>", unsafe_allow_html=True)
                     st.divider()
 
-                tax = subtotal * TAX_RATE
-                grand_total = subtotal + tax
-                st.write(f"**Subtotal:** {money(subtotal)}")
-                st.write(f"**Tax ({TAX_RATE:.0%}):** {money(tax)}")
-                st.markdown(f"### Grand Total: `{money(grand_total)}`")
+                st.markdown(f"### Total: `{money(total)}`")
 
                 b_clear, b_pay = st.columns([1, 2])
                 if b_clear.button("🧹 Clear", key="clear_cart", width="stretch", help="Empty the cart"):
@@ -721,13 +963,20 @@ with tab_pos:
 with tab_catalog:
     f1, f2, f3 = st.columns([3, 1, 1])
     with f1:
-        cat_search = tidy(st.text_input("🔍 Search catalog by brand or product name...", key="cat_search")).lower()
+        cat_search = tidy(
+            st.text_input("🔍 Search brand, product, type or shade...", key="cat_search")
+        ).lower()
     with f2:
         area_filter = st.selectbox("Target Area", ["All"] + CATEGORIES, key="cat_area")
     with f3:
         status_filter = st.selectbox("Stock Availability", ["All", "Available", "Sold Out"], key="cat_status")
 
-    filtered = [i for i in inventory_items if matches(i, cat_search)]
+    cat_types = type_pills("cat_types")
+
+    filtered = [
+        i for i in inventory_items
+        if matches(i, cat_search) and (not cat_types or i["product_type"] in cat_types)
+    ]
     if area_filter != "All":
         filtered = [i for i in filtered if i["category"] == area_filter]
     if status_filter == "Available":
@@ -735,16 +984,19 @@ with tab_catalog:
     elif status_filter == "Sold Out":
         filtered = [i for i in filtered if i["quantity"] <= 0]
 
-    st.caption(f"Showing {len(filtered)} of {len(inventory_items)} products")
+    filters_active = bool(cat_search or cat_types or area_filter != "All" or status_filter != "All")
+    count_col, clear_col = st.columns([5, 1])
+    count_col.caption(f"Showing {len(filtered)} of {len(inventory_items)} products")
+    if filters_active:
+        clear_col.button("✖ Clear filters", key="clear_filters", on_click=reset_catalog_filters, width="stretch")
 
     if not inventory_items:
         st.info("The catalog is empty. Products will appear here once they're added.")
     elif not filtered:
         st.info("No items match your filters. Try clearing the search or setting filters back to All.")
     else:
-        per_row = 3
-        for start in range(0, len(filtered), per_row):
-            row_cols = st.columns(per_row)
+        for start in range(0, len(filtered), GRID_COLUMNS):
+            row_cols = st.columns(GRID_COLUMNS)
             for offset, col in enumerate(row_cols):
                 if start + offset >= len(filtered):
                     continue
@@ -753,9 +1005,10 @@ with tab_catalog:
                     with st.container(border=True, key=f"card_cat_{item['id']}"):
                         if item["image_url"]:
                             st.image(item["image_url"], width="stretch")
-                        st.markdown(f"### {esc(item['brand'])}")
+                        st.markdown(f"#### {esc(item['brand'])}")
                         st.markdown(f"**{esc(item['product_name'])}**")
                         st.markdown(
+                            f"{type_badge(item)}"
                             f"<span class='badge category-badge'>{esc(item['category'])}</span>"
                             f"<span class='badge shade-badge'>Shade: {esc(item['tone'])}</span>"
                             f"{status_badge(item['quantity'])}",
@@ -766,8 +1019,7 @@ with tab_catalog:
                             unsafe_allow_html=True,
                         )
                         if is_admin:
-                            if st.button("🗑️ Quick Delete", key=f"quick_del_{item['id']}", width="stretch",
-                                         help="You can undo this right after"):
+                            if st.button("🗑️ Quick Delete", key=f"quick_del_{item['id']}", width="stretch", help="You can undo this right after"):
                                 try:
                                     delete_item(item)
                                     st.rerun()
@@ -806,6 +1058,7 @@ with tab_manage:
         brand_opts = dedupe_ci(existing_brands + [sel["brand"]])
         name_opts = dedupe_ci(existing_names + [sel["product_name"]])
         tone_opts = dedupe_ci(existing_tones + [sel["tone"]])
+        type_opts = dedupe_ci(existing_types + [sel["product_type"]])
 
         e1, e2 = st.columns(2)
         with e1:
@@ -818,6 +1071,11 @@ with tab_manage:
                 "Product Name", name_opts, index=idx_ci(name_opts, sel["product_name"]),
                 accept_new_options=True, key=f"edit_name_{ek}",
             )
+            edit_type = st.selectbox(
+                "Makeup Type", type_opts, index=idx_ci(type_opts, sel["product_type"]),
+                accept_new_options=True, key=f"edit_type_{ek}", disabled=not HAS_TYPE,
+                help="Type a new type and press Enter to create it.",
+            )
             cat_idx = CATEGORIES.index(sel["category"]) if sel["category"] in CATEGORIES else 0
             edit_category = st.selectbox("Target Area", CATEGORIES, index=cat_idx, key=f"edit_cat_{ek}")
         with e2:
@@ -825,16 +1083,14 @@ with tab_manage:
                 "Tone / Shade", tone_opts, index=idx_ci(tone_opts, sel["tone"]),
                 accept_new_options=True, key=f"edit_tone_{ek}",
             )
-            edit_qty = st.number_input("Stock Quantity", min_value=0, step=1, value=sel["quantity"],
-                                       key=f"edit_qty_{ek}")
+            edit_qty = st.number_input("Stock Quantity", min_value=0, step=1, value=sel["quantity"], key=f"edit_qty_{ek}")
             edit_price = st.number_input(
                 "Retail Price", min_value=0.0, step=0.5, value=sel["price"], format="%.2f", key=f"edit_price_{ek}"
             )
 
         if sel["image_url"]:
             st.image(sel["image_url"], width=140, caption="Current image")
-        new_image = st.file_uploader("Replace image (optional)", type=["png", "jpg", "jpeg", "webp"],
-                                     key=f"edit_img_{ek}")
+        new_image = st.file_uploader("Replace image (optional)", type=["png", "jpg", "jpeg", "webp"], key=f"edit_img_{ek}")
 
         # Live validation: tell the user before they press Save
         brand_n, name_n, tone_n = normalize_fields(edit_brand, edit_name, edit_tone)
@@ -846,19 +1102,19 @@ with tab_manage:
             "quantity": int(edit_qty or 0),
             "price": float(edit_price or 0.0),
         }
+        if HAS_TYPE:
+            update_data["product_type"] = normalize_type(edit_type)
         changed = new_image is not None or any(update_data[f] != sel[f] for f in update_data)
         clash = find_duplicate(brand_n, name_n, tone_n, exclude_id=k)
 
         if clash:
-            st.warning(
-                f"Another item already uses this brand, product and shade: **{label_of(clash)}**. Change one of them to save.")
+            st.warning(f"Another item already uses this brand, product and shade: **{label_of(clash)}**. Change one of them to save.")
         elif not changed:
             st.caption("No changes yet.")
 
         b1, b2, b3 = st.columns(3)
         with b1:
-            if st.button("💾 Save Changes", type="primary", width="stretch", key=f"save_btn_{k}",
-                         disabled=bool(clash) or not changed):
+            if st.button("💾 Save Changes", type="primary", width="stretch", key=f"save_btn_{k}", disabled=bool(clash) or not changed):
                 try:
                     with st.spinner("Saving…"):
                         if new_image is not None:
@@ -871,13 +1127,11 @@ with tab_manage:
                 except Exception as update_err:
                     st.error(f"Failed to update item: {update_err}")
         with b2:
-            if st.button("↩️ Reset form", width="stretch", key=f"reset_btn_{k}", disabled=not changed,
-                         help="Discard unsaved edits"):
+            if st.button("↩️ Reset form", width="stretch", key=f"reset_btn_{k}", disabled=not changed, help="Discard unsaved edits"):
                 st.session_state[f"edit_nonce_{k}"] = en + 1
                 st.rerun()
         with b3:
-            if st.button("🗑️ Delete Item", type="secondary", width="stretch", key=f"full_del_btn_{k}",
-                         help="You can undo this right after"):
+            if st.button("🗑️ Delete Item", type="secondary", width="stretch", key=f"full_del_btn_{k}", help="You can undo this right after"):
                 try:
                     delete_item(sel)
                     st.rerun()
@@ -899,8 +1153,8 @@ with tab_analytics:
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Unique Items", total_products)
         m2.metric("In-Stock Units", total_stock)
-        m3.metric("Inventory Value ($)", money(total_inventory_val))
-        m4.metric("Total Revenue Realized ($)", money(total_revenue))
+        m3.metric("Inventory Value", money(total_inventory_val))
+        m4.metric("Total Revenue Realized", money(total_revenue))
 
         st.divider()
         st.subheader("Completed Sales History")
@@ -910,14 +1164,13 @@ with tab_analytics:
                 if not isinstance(items, list):
                     return ""
                 return "; ".join(
-                    f"{i.get('brand', 'N/A')} {i.get('product_name', '')} ×{i.get('quantity', 0)} @ ${float(i.get('unit_price') or 0):.2f}"
+                    f"{i.get('brand', 'N/A')} {i.get('product_name', '')} ×{i.get('quantity', 0)} @ {float(i.get('unit_price') or 0):.2f}"
                     for i in items
                 )
 
-
             df = pd.DataFrame(
                 {
-                    "Total Revenue ($)": [float(s.get("total_amount") or 0.0) for s in sales_history],
+                    "Total Revenue": [float(s.get("total_amount") or 0.0) for s in sales_history],
                     "Timestamp": pd.to_datetime([s.get("created_at") for s in sales_history], errors="coerce"),
                     "Items Sold Details": [describe(s.get("items_sold")) for s in sales_history],
                 }
@@ -927,10 +1180,29 @@ with tab_analytics:
                 hide_index=True,  # internal IDs never shown
                 width="stretch",
                 column_config={
-                    "Total Revenue ($)": st.column_config.NumberColumn(format="$%.2f"),
+                    "Total Revenue": st.column_config.NumberColumn(format="%.2f"),
                     "Timestamp": st.column_config.DatetimeColumn(format="D MMM YYYY, HH:mm"),
                     "Items Sold Details": st.column_config.TextColumn(width="large"),
                 },
             )
+
+            st.divider()
+            st.subheader("🧾 Reprint a Receipt")
+            sales_by_id = {s["id"]: s for s in sales_history}
+
+            def sale_label(sid):
+                r = build_receipt(sales_by_id[sid])
+                return f"No. {r['number']} · {r['date']} · {money(r['total'])}"
+
+            picked_sale = st.selectbox(
+                "Select a past sale",
+                options=list(sales_by_id.keys()),
+                format_func=sale_label,
+                index=None,
+                placeholder="Choose a sale to view or download its receipt",
+                key="reprint_sale",
+            )
+            if picked_sale is not None:
+                render_receipt(build_receipt(sales_by_id[picked_sale]), f"past_{picked_sale}")
         else:
             st.info("No sales transactions recorded yet. Completed checkouts will show up here.")
