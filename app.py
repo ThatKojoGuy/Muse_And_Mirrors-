@@ -275,6 +275,9 @@ for key, default in {
     "has_type": False,  # becomes True once the product_type column exists
     "has_void": False,  # becomes True once the sales.voided columns exist
     "rcpt_msg": None,  # result of the last void/delete action
+    "has_who": False,  # becomes True once sales.customer_name / served_by exist
+    "last_served_by": "",  # the cashier is remembered between sales
+    "sale_nonce": 0,  # bump to clear the customer-name box after a sale
 }.items():
     st.session_state.setdefault(key, default)
 
@@ -297,6 +300,15 @@ if not st.session_state["has_void"]:
     except Exception:
         st.session_state["has_void"] = False
 HAS_VOID = st.session_state["has_void"]
+
+# ...and for the optional customer name / cashier columns
+if not st.session_state["has_who"]:
+    try:
+        supabase.table("sales").select("customer_name,served_by").limit(1).execute()
+        st.session_state["has_who"] = True
+    except Exception:
+        st.session_state["has_who"] = False
+HAS_WHO = st.session_state["has_who"]
 
 # =====================================================================
 # DATA
@@ -375,6 +387,8 @@ def build_receipt(sale: dict) -> dict:
         "when": when,
         "voided": bool(sale.get("voided")),
         "void_reason": (sale.get("void_reason") or "").strip(),
+        "customer": tidy(sale.get("customer_name")),
+        "served_by": tidy(sale.get("served_by")),
     }
 
 
@@ -386,6 +400,11 @@ def receipt_html(r: dict) -> str:
         for li in r["lines"]
     )
     contact = "".join(f"<div>{esc(x)}</div>" for x in (BUSINESS_ADDRESS, BUSINESS_PHONE) if x)
+    who_html = "".join(
+        f"<br>{label}: {esc(r[k])}"
+        for k, label in (("customer", "Customer"), ("served_by", "Served by"))
+        if r.get(k)
+    )
     void_block = ""
     if r.get("voided"):
         why = f"<br><span style='font-size:13px;font-weight:400'>{esc(r['void_reason'])}</span>" if r.get("void_reason") else ""
@@ -404,7 +423,7 @@ def receipt_html(r: dict) -> str:
  @media print{{body{{margin:0}}}}
 </style></head><body>
 <h1>{esc(BUSINESS_NAME)}</h1><div class="c">{contact}</div>
-<p class="c"><b>RECEIPT No. {esc(r['number'])}</b><br>{esc(r['date'])}</p>{void_block}
+<p class="c"><b>RECEIPT No. {esc(r['number'])}</b><br>{esc(r['date'])}{who_html}</p>{void_block}
 <table><tr><th>Item</th><th class="n">Qty</th><th class="n">Price</th><th class="n">Total</th></tr>{rows}</table>
 <div class="t">TOTAL {money(r['total'])}</div>
 <p class="c">{r['units']} item(s) &middot; Thank you for shopping with us!</p>
@@ -446,6 +465,10 @@ def receipt_pdf(r: dict):
     pdf.ln(3)
     row("RECEIPT", h=7, style="B", size=12, align="C")
     row(f"No. {r['number']}   |   {r['date']}", align="C")
+    if r.get("customer"):
+        row(f"Customer: {r['customer']}", align="C")
+    if r.get("served_by"):
+        row(f"Served by: {r['served_by']}", align="C")
     if r.get("voided"):
         pdf.set_text_color(176, 0, 32)
         row("*** VOID ***", h=8, style="B", size=14, align="C")
@@ -477,6 +500,13 @@ def render_receipt(r: dict, prefix: str):
         if sub:
             st.caption(sub)
         st.markdown(f"**Receipt No. {esc(r['number'])}** · {esc(r['date'])}")
+        who = " · ".join(
+            f"{label}: **{esc(r[k])}**"
+            for k, label in (("customer", "Customer"), ("served_by", "Served by"))
+            if r.get(k)
+        )
+        if who:
+            st.markdown(who)
         if r.get("voided"):
             st.error("🚫 **VOID**" + (f" — {r['void_reason']}" if r.get("void_reason") else ""))
         # Stacked lines (not a wide table) so every amount fits the narrow cart column
@@ -594,10 +624,11 @@ def add_to_cart(item_id):
     return None
 
 
-def complete_sale(cart_lines: dict):
+def complete_sale(cart_lines: dict, customer: str = "", served_by: str = ""):
     """Returns (ok, receipt_dict_or_list_of_problems). Stock is re-checked live,
     decremented with a guard against concurrent sales, and rolled back if
-    logging the sale fails."""
+    logging the sale fails. `customer` and `served_by` are optional."""
+    customer, served_by = tidy(customer)[:80], tidy(served_by)[:80]
     ids = list(cart_lines.keys())
     fresh_rows = (
         supabase.table("inventory")
@@ -651,9 +682,13 @@ def complete_sale(cart_lines: dict):
                 )
             decremented.append((iid, current))
 
-        ins = supabase.table("sales").insert(
-            {"total_amount": total, "items_sold": items_sold}
-        ).execute()
+        payload = {"total_amount": total, "items_sold": items_sold}
+        if HAS_WHO:  # older databases simply don't store these two optional fields
+            if customer:
+                payload["customer_name"] = customer
+            if served_by:
+                payload["served_by"] = served_by
+        ins = supabase.table("sales").insert(payload).execute()
         sale_row = (ins.data or [{}])[0]
     except Exception as exc:
         for iid, original in decremented:
@@ -1237,14 +1272,38 @@ with tab_pos:
 
                 st.markdown(f"### Total: `{money(total)}`")
 
+                # Optional details that appear on the receipt
+                staff = dedupe_ci(
+                    s["served_by"] for s in sales_history if tidy(s.get("served_by"))
+                )
+                last = st.session_state["last_served_by"]
+                if last and idx_ci(staff, last) is None:
+                    staff.append(last)
+                customer_in = st.text_input(
+                    "Customer name (optional)", max_chars=80, disabled=not HAS_WHO,
+                    key=f"sale_customer_{st.session_state['sale_nonce']}",
+                    placeholder="e.g., Ama Mensah",
+                )
+                served_in = st.selectbox(
+                    "Served by (optional)", staff, index=idx_ci(staff, last),
+                    accept_new_options=True, disabled=not HAS_WHO, key="sale_served_by",
+                    placeholder="Who made this sale? Pick or type a name",
+                    help="Remembered for the next sale. Type a new name to add it.",
+                )
+                served_in = canon(served_in, staff) if served_in else ""
+                st.session_state["last_served_by"] = served_in
+                if not HAS_WHO:
+                    st.caption("Run the latest `setup.sql` once to enable these two fields.")
+
                 b_clear, b_pay = st.columns([1, 2])
                 if b_clear.button("🧹 Clear", key="clear_cart", width="stretch", help="Empty the cart"):
                     cart.clear()
                     st.rerun()
                 if b_pay.button("💳 Complete Transaction", type="primary", width="stretch"):
                     with st.spinner("Recording sale…"):
-                        ok, result = complete_sale(cart)
+                        ok, result = complete_sale(cart, customer_in, served_in)
                     if ok:
+                        st.session_state["sale_nonce"] += 1  # clears the customer box
                         st.session_state["cart"] = {}
                         st.session_state["last_receipt"] = result
                         st.balloons()
@@ -1500,7 +1559,7 @@ with tab_analytics:
             st.info("No sales transactions recorded yet. Completed checkouts will show up here.")
         else:
             f1, f2, f3 = st.columns([3, 2, 2])
-            q = tidy(f1.text_input("🔍 Search receipt no. or items", key="rcpt_search")).lower()
+            q = tidy(f1.text_input("🔍 Search receipt no., customer, staff or items", key="rcpt_search")).lower()
             date_pick = f2.date_input("Date range", value=(), key="rcpt_dates")
             status_pick = f3.selectbox("Status", ["All", "Completed", "Voided"], key="rcpt_status")
 
@@ -1511,7 +1570,8 @@ with tab_analytics:
             pairs = []
             for sale in sales_history:
                 r = build_receipt(sale)
-                hay = f"{r['number']} {describe_sale(sale.get('items_sold'))}".lower()
+                hay = (f"{r['number']} {r['customer']} {r['served_by']} "
+                       f"{describe_sale(sale.get('items_sold'))}").lower()
                 if q and not all(w in hay for w in q.split()):
                     continue
                 if lo and not (lo <= r["when"].date() <= hi):
@@ -1530,6 +1590,8 @@ with tab_analytics:
                     {
                         "Receipt No.": [r["number"] for _, r in pairs],
                         "Timestamp": [r["when"] for _, r in pairs],
+                        "Customer": [r["customer"] or "-" for _, r in pairs],
+                        "Served by": [r["served_by"] or "-" for _, r in pairs],
                         "Items Sold Details": [describe_sale(s.get("items_sold")) for s, _ in pairs],
                         "Total": [r["total"] for _, r in pairs],
                         "Status": ["🚫 VOID" if r["voided"] else "✓ Completed" for _, r in pairs],
